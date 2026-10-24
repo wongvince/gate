@@ -324,31 +324,82 @@ def classify_network(host, exit_org, is_datacenter=None):
     return "unknown"
 
 def check_one(node, session):
-    url = WORKER_CHECK_URL + quote(f"{node['host']}:{node['port']}", safe="")
+    url = WORKER_CHECK_URL + quote(
+        f"{node['host']}:{node['port']}", safe=""
+    )
+
     out = dict(node)
     out["protocol"] = "sstp"
     out["link"] = f"sstp://vpn:vpn@{node['host']}:{node['port']}"
     out["status"] = "failed"
-    out["checked_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    out["checked_at"] = datetime.now(timezone.utc).strftime(
+        "%Y-%m-%d %H:%M UTC"
+    )
     out["exit"] = None
     out["residential"] = "unknown"
+
     try:
-        r = session.get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
+        r = session.get(
+            url,
+            timeout=CHECK_TIMEOUT,
+            headers={
+                "User-Agent": "Mozilla/5.0 (gate-checker)",
+                "Accept": "application/json",
+            },
+        )
+
+        # HTTP 状态码不是 200
         if r.status_code != 200:
-            out["error"] = f"HTTP {r.status_code}"
+            out["error"] = (
+                f"HTTP {r.status_code}; "
+                f"content-type={r.headers.get('Content-Type')}; "
+                f"body={r.text[:300]!r}"
+            )
             out["worker_error"] = True
             return out
-        j = r.json()
+
+        # 尝试解析 JSON，并保留解析失败时的响应信息
+        try:
+            j = r.json()
+        except ValueError as exc:
+            out["error"] = (
+                f"JSON解析失败: {exc}; "
+                f"HTTP={r.status_code}; "
+                f"content-type={r.headers.get('Content-Type')}; "
+                f"body={r.text[:300]!r}"
+            )
+            out["worker_error"] = True
+            return out
+
+        # 校验 JSON 顶层结构
+        if not isinstance(j, dict):
+            out["error"] = (
+                f"JSON格式错误: 顶层不是对象; "
+                f"body={r.text[:300]!r}"
+            )
+            out["worker_error"] = True
+            return out
+
         ok = bool(j.get("success"))
         out["success"] = ok
         out["status"] = "success" if ok else "failed"
         out["latency_ms"] = j.get("responseTime")
         out["colo"] = j.get("colo")
-        out["error"] = (None if ok else (j.get("error") or j.get("message") or "check failed"))
+        out["error"] = (
+            None if ok
+            else (j.get("error") or j.get("message") or "check failed")
+        )
+
         exit_info = j.get("exit") or {}
-        if exit_info:
+
+        if isinstance(exit_info, dict) and exit_info:
             asn = exit_info.get("asn") or {}
+
+            if not isinstance(asn, dict):
+                asn = {}
+
             org = asn.get("org") or asn.get("name") or ""
+
             out["exit"] = {
                 "ip": exit_info.get("ip"),
                 "country": exit_info.get("country"),
@@ -360,10 +411,19 @@ def check_one(node, session):
                 "type": asn.get("type"),
                 "is_datacenter": exit_info.get("is_datacenter"),
             }
-            out["residential"] = classify_network(out["host"], org, exit_info.get("is_datacenter"))
+
+            out["residential"] = classify_network(
+                out["host"],
+                org,
+                exit_info.get("is_datacenter"),
+            )
         else:
-            out["residential"] = classify_network(out["host"], None, None)
+            out["residential"] = classify_network(
+                out["host"], None, None
+            )
+
         return out
+
     except Exception as exc:
         out["error"] = f"{type(exc).__name__}: {exc}"
         out["worker_error"] = True
