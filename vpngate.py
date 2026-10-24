@@ -491,6 +491,17 @@ def main():
     log("CLOUDFLARE WORKER", f"提交检测: {len(uniq)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s)")
     t0 = time.time()
     results = check_all(uniq, session)
+      # 临时诊断：输出前 3 个 Worker 异常
+    worker_errors_debug = [
+        r for r in results if r.get("worker_error")
+    ]
+    for item in worker_errors_debug[:3]:
+        log(
+            "WORKER DEBUG",
+            f"host={item.get('host')} "
+            f"port={item.get('port')} "
+            f"error={item.get('error')}"
+        )
     elapsed = time.time() - t0
 
     success = [r for r in results if r.get("success")]
