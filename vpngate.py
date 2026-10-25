@@ -85,7 +85,9 @@ EDGE_HOSTS = [
     h.strip()
     for h in os.environ.get(
         "EDGE_HOSTS",
-        "hzytjy.cn:2083","saas.sin.fan:2083","stores.staples.com:443","www.giannidelprete.it:2053","www.shopify.com:2053","www.zendesk.com:8443",
+        "EDGE_HOSTS",
+        "hzytjy.cn:2083,saas.sin.fan:2083,stores.staples.com:443,"
+        "www.giannidelprete.it:2053,www.shopify.com:2053,www.zendesk.com:8443",
     ).split(",")
     if h.strip()
 ]
