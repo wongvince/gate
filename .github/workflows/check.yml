@@ -1,8 +1,12 @@
 
-name: VPN Gate Node Check
+name: PublicVPNList UDP Candidates
 
 on:
   workflow_dispatch:
+
+  # 如果想每小时自动更新，取消下面两行注释
+  # schedule:
+  #   - cron: "0 * * * *"
 
 permissions:
   contents: read
@@ -16,7 +20,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
 
     steps:
       - name: Checkout
@@ -30,41 +34,11 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Get VPN Gate nodes + check via Cloudflare Worker + build page
-        run: python vpngate.py
-        env:
-          # 保留现有 Worker 检测流程，不做修改
-          CHECK_WORKER: ${{ secrets.DOMAIN }}
-          CHECK_CONCURRENCY: "32"
-          CHECK_TIMEOUT: "90"
-
-      - name: Collect PublicVPNList UDP candidates
+      - name: Collect UDP candidates
         env:
           PUBLICVPNLIST_TOKEN: ${{ secrets.PUBLICVPNLIST_TOKEN }}
           PUBLIC_DIR: public
-        run: |
-          python -m pip install requests
-          python publicvpnlist_udp.py
-
-      - name: Ensure GitHub Pages is enabled
-        run: |
-          code=$(curl -s -o /dev/null -w '%{http_code}' \
-            -H "Authorization: Bearer $GITHUB_TOKEN" \
-            "https://api.github.com/repos/$GITHUB_REPOSITORY/pages")
-          echo "Pages API status: $code"
-
-          if [ "$code" = "404" ]; then
-            echo "首次运行: 启用 GitHub Pages"
-            curl -sS -X PUT \
-              -H "Authorization: Bearer $GITHUB_TOKEN" \
-              -H "Content-Type: application/json" \
-              -d '{"build_type":"workflow","source":{"branches":["main"],"path":"/public"}}' \
-              "https://api.github.com/repos/$GITHUB_REPOSITORY/pages"
-            echo
-            sleep 10
-          fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python publicvpnlist_udp.py
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
@@ -80,5 +54,5 @@ jobs:
 
       - name: Show site URL
         run: |
-          echo "site: https://wongvince.github.io/gate/"
-          echo "deploy outcome: ${{ steps.deployment.outcome }}"
+          echo "Site: https://wongvince.github.io/gate/"
+          echo "JSON: https://wongvince.github.io/gate/udp_candidates.json"
