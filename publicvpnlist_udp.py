@@ -1,16 +1,13 @@
 
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""
-PublicVPNList UDP 候选节点采集器
 
-输出：
-    public/udp_candidates.json
+"""PublicVPNList UDP 候选采集器。
 
-注意：
-    1. 本脚本只采集候选节点元数据。
-    2. 不代表节点的 UDP 转发、代理连通性或 PUBG 游戏可用性已验证。
-    3. 请在 GitHub Actions Secrets 中设置 PUBLICVPNLIST_TOKEN。
+输出 public/udp_candidates.json。
+
+仅收集 Hysteria2/TUIC 元数据，不代表节点已连通、
+UDP 转发已验证或 PUBG 游戏可用。
 """
 
 import json
@@ -19,277 +16,113 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urljoin
 
 import requests
 
-
 API = "https://publicvpnlist.com/api/v1/servers"
-
 TOKEN = os.environ.get("PUBLICVPNLIST_TOKEN", "").strip()
 OUT = Path(os.environ.get("PUBLIC_DIR", "public"))
 
-TIMEOUT = 20
-PER_PAGE = 100
-MAX_PAGES = 20
-FRESH_WITHIN = 86400
-
 PROTOCOLS = ("hysteria2", "tuic")
-COUNTRIES = ("JP", "KR")
-
-USER_AGENT = "wongvince-gate-udp-checker/2.0"
+COUNTRIES = {"JP", "KR"}
+PER_PAGE = 200
+TIMEOUT = 25
+MAX_PAGES = 20
 
 
 def log(message):
     print(message, flush=True)
 
 
-def get_first(row, *keys):
-    """返回第一个非空字段。"""
-    for key in keys:
-        value = row.get(key)
-        if value is not None and value != "":
-            return value
-    return None
-
-
-def normalize_text(value):
-    if value is None:
-        return ""
-    return str(value).strip().lower()
-
-
-def extract_rows(payload):
-    """
-    从常见 JSON 响应结构提取记录。
-    无法识别时抛错，避免把未知响应误认为零条数据。
-    """
-    if isinstance(payload, list):
-        return payload
-
-    if not isinstance(payload, dict):
-        raise RuntimeError(
-            f"无法识别的 API 响应类型：{type(payload).__name__}"
-        )
-
-    # 常见格式：{"data": [...]}
-    data = payload.get("data")
-    if isinstance(data, list):
-        return data
-
-    # 常见格式：{"data": {"servers": [...]}}
-    if isinstance(data, dict):
-        for key in ("servers", "results", "items"):
-            value = data.get(key)
-            if isinstance(value, list):
-                return value
-
-    # 其他常见格式
-    for key in ("servers", "results", "items"):
-        value = payload.get(key)
-        if isinstance(value, list):
-            return value
-
-    raise RuntimeError(
-        "无法识别 API 返回结构；"
-        f"顶层字段：{list(payload.keys())}"
-    )
-
-
-def country_code_of(row):
-    """兼容常见国家代码字段。"""
-    value = get_first(
-        row,
-        "country_code",
-        "countryCode",
-        "country",
-    )
-
-    if isinstance(value, dict):
-        value = get_first(value, "code", "country_code", "iso2")
-
-    return str(value or "").strip().upper()
-
-
-def protocol_of(row):
-    return normalize_text(
-        get_first(row, "protocol", "protocol_name", "type")
-    )
-
-
-def get_host(row):
-    return get_first(
-        row,
-        "hostname",
-        "host",
-        "ip",
-        "server",
-    )
-
-
-def get_port(row):
-    value = get_first(row, "port", "server_port")
-
-    try:
-        port = int(value)
-    except (TypeError, ValueError):
-        return None
-
-    if 1 <= port <= 65535:
-        return port
-
-    return None
-
-
-def parse_candidate(row, expected_protocol, expected_country):
-    """检查字段并生成标准化候选记录。"""
-    if not isinstance(row, dict):
-        return None, "记录不是 JSON 对象"
-
-    actual_protocol = protocol_of(row)
-    actual_country = country_code_of(row)
-
-    # 只接受本次查询目标对应的协议和国家。
-    if actual_protocol != expected_protocol:
-        return None, "协议不匹配"
-
-    if actual_country != expected_country:
-        return None, "国家不匹配"
-
-    host = get_host(row)
-    port = get_port(row)
-    public_id = get_first(row, "id", "server_id", "uuid")
-
-    if not host:
-        return None, "缺少主机名或 IP"
-
-    if port is None:
-        return None, "端口缺失或无效"
-
-    # 不假定 API 一定提供 id；没有 id 时用主机和端口去重。
-    candidate_id = (
-        str(public_id)
-        if public_id is not None
-        else f"{host}:{port}"
-    )
-
-    candidate = {
-        "id": candidate_id,
-        "country_code": actual_country,
-        "protocol": actual_protocol,
-        "transport": get_first(row, "transport"),
-        "hostname": str(host),
-        "ip": get_first(row, "ip"),
-        "port": port,
-        "latency_ms": get_first(
-            row, "latency_ms", "latency", "ping"
-        ),
-        "speed_mbps": get_first(
-            row, "speed_mbps", "speed"
-        ),
-        "last_checked_at": get_first(
-            row, "last_checked_at", "last_checked"
-        ),
-        "config_updated_at": get_first(
-            row, "config_updated_at", "config_updated"
-        ),
-        "source": "PublicVPNList",
-        "udp_tunnel_verified": False,
-        "game_tested": False,
-    }
-
-    return candidate, None
-
-
-def fetch_page(session, protocol, country, page):
-    """请求一页数据，并输出诊断信息。"""
+def fetch_pages(session, protocol):
+    """按官方分页链接获取数据；不预先限制国家和状态。"""
+    url = API
     params = {
         "protocol": protocol,
-        "country": country,
-        "status": "online",
-        "fresh_within": FRESH_WITHIN,
-        "page": page,
+        "page": 1,
         "per_page": PER_PAGE,
         "sort": "last_checked",
         "order": "desc",
     }
+    all_rows = []
+    page_count = 0
 
-    response = session.get(
-        API,
-        params=params,
-        timeout=TIMEOUT,
-    )
+    while url and page_count < MAX_PAGES:
+        page_count += 1
 
-    log(
-        f"[HTTP] {protocol}/{country}/page={page} "
-        f"status={response.status_code}"
-    )
-
-    if response.status_code == 401:
-        raise RuntimeError(
-            "API Token 无效或已过期（HTTP 401）"
+        response = session.get(
+            url,
+            params=params if url == API else None,
+            timeout=TIMEOUT,
         )
 
-    if response.status_code == 403:
-        raise RuntimeError(
-            "API 拒绝请求（HTTP 403），"
-            "请检查 Token 权限和 API 使用限制"
-        )
+        log(f"[HTTP] protocol={protocol} page={page_count} "
+            f"status={response.status_code}")
+        log(f"[URL] {response.url}")
 
-    if response.status_code == 429:
-        raise RuntimeError(
-            "API 请求限流（HTTP 429），"
-            "请降低请求频率后重试"
-        )
+        if response.status_code == 401:
+            raise RuntimeError("HTTP 401：API Token 缺失或已过期")
+        if response.status_code == 403:
+            raise RuntimeError("HTTP 403：API 拒绝请求，请检查访问权限")
+        if response.status_code == 429:
+            raise RuntimeError("HTTP 429：请求过于频繁，请稍后重试")
 
-    response.raise_for_status()
+        response.raise_for_status()
 
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        content_type = response.headers.get(
-            "content-type", ""
-        )
-        preview = response.text[:200].replace("\n", " ")
-        raise RuntimeError(
-            f"API 未返回有效 JSON；"
-            f"content-type={content_type!r}；"
-            f"响应预览={preview!r}"
-        ) from exc
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise RuntimeError(
+                f"响应不是有效 JSON：{response.text[:200]!r}"
+            ) from exc
 
-    rows = extract_rows(payload)
+        if not isinstance(payload, dict):
+            raise RuntimeError(
+                f"响应顶层不是 JSON 对象：{type(payload).__name__}"
+            )
 
-    log(
-        f"[DATA] {protocol}/{country}/page={page} "
-        f"records={len(rows)}"
-    )
+        log(f"[TOP_KEYS] {list(payload.keys())}")
 
-    if rows and isinstance(rows[0], dict):
-        log(
-            "[FIELDS] "
-            + ", ".join(str(key) for key in rows[0].keys())
-        )
+        rows = payload.get("data")
+        if not isinstance(rows, list):
+            raise RuntimeError(
+                "响应缺少列表型 data 字段；"
+                f"顶层字段={list(payload.keys())}"
+            )
 
-        summary_keys = (
-            "id",
-            "protocol",
-            "country",
-            "country_code",
-            "transport",
-            "hostname",
-            "ip",
-            "port",
-        )
-        summary = {
-            key: rows[0].get(key)
-            for key in summary_keys
-            if key in rows[0]
-        }
-        log(
-            "[FIRST_RECORD] "
-            + json.dumps(summary, ensure_ascii=False)
-        )
+        meta = payload.get("meta")
+        links = payload.get("links")
 
-    return rows
+        log(f"[META] {json.dumps(meta, ensure_ascii=False)}")
+        log(f"[LINKS] {json.dumps(links, ensure_ascii=False)}")
+        log(f"[ROWS] {len(rows)}")
+
+        if rows and isinstance(rows[0], dict):
+            log("[FIRST_ROW_FIELDS] "
+                + json.dumps(list(rows[0].keys()), ensure_ascii=False))
+            safe_keys = (
+                "id", "protocol", "country_code", "country_name",
+                "transport", "hostname", "ip", "port",
+                "availability_status", "last_checked_at",
+            )
+            log("[FIRST_ROW_SAMPLE] " + json.dumps(
+                {k: rows[0].get(k) for k in safe_keys if k in rows[0]},
+                ensure_ascii=False,
+            ))
+
+        all_rows.extend(rows)
+
+        next_url = links.get("next") if isinstance(links, dict) else None
+        if not next_url:
+            break
+
+        # 只跟随官方返回的下一页链接。
+        url = urljoin(API, str(next_url))
+        params = None
+        time.sleep(0.5)
+
+    return all_rows
 
 
 def main():
@@ -301,75 +134,87 @@ def main():
     session.headers.update({
         "Authorization": f"Bearer {TOKEN}",
         "Accept": "application/json",
-        "User-Agent": USER_AGENT,
+        "User-Agent": "wongvince-gate-udp-collector/3.0",
     })
 
     candidates = {}
     errors = []
     stats = {
-        "requests_ok": 0,
-        "records_received": 0,
-        "protocol_country_matches": 0,
-        "candidates_added": 0,
-        "records_rejected": {},
+        "protocol_records": {},
+        "jp_kr_records": 0,
+        "rejected": {},
     }
 
     for protocol in PROTOCOLS:
-        for country in COUNTRIES:
-            for page in range(1, MAX_PAGES + 1):
+        try:
+            rows = fetch_pages(session, protocol)
+            stats["protocol_records"][protocol] = len(rows)
+
+            for row in rows:
+                if not isinstance(row, dict):
+                    stats["rejected"]["not_object"] = (
+                        stats["rejected"].get("not_object", 0) + 1
+                    )
+                    continue
+
+                actual_protocol = str(row.get("protocol") or "").lower()
+                country = str(row.get("country_code") or "").upper()
+
+                if actual_protocol != protocol:
+                    stats["rejected"]["protocol_mismatch"] = (
+                        stats["rejected"].get("protocol_mismatch", 0) + 1
+                    )
+                    continue
+
+                if country not in COUNTRIES:
+                    continue
+
+                stats["jp_kr_records"] += 1
+
+                host = row.get("hostname") or row.get("ip")
+                port_value = row.get("port")
+                public_id = row.get("id")
+
                 try:
-                    rows = fetch_page(
-                        session,
-                        protocol,
-                        country,
-                        page,
+                    port = int(port_value)
+                except (TypeError, ValueError):
+                    port = None
+
+                if not host or not port or not 1 <= port <= 65535:
+                    stats["rejected"]["missing_host_or_port"] = (
+                        stats["rejected"].get("missing_host_or_port", 0) + 1
                     )
-                    stats["requests_ok"] += 1
-                    stats["records_received"] += len(rows)
+                    continue
 
-                    for row in rows:
-                        candidate, reason = parse_candidate(
-                            row,
-                            protocol,
-                            country,
-                        )
+                candidate_id = (
+                    str(public_id) if public_id is not None
+                    else f"{host}:{port}"
+                )
+                key = f"{protocol}:{country}:{candidate_id}"
 
-                        if candidate is None:
-                            stats["records_rejected"][reason] = (
-                                stats["records_rejected"].get(
-                                    reason, 0
-                                ) + 1
-                            )
-                            continue
+                candidates[key] = {
+                    "id": candidate_id,
+                    "country_code": country,
+                    "country_name": row.get("country_name"),
+                    "protocol": protocol,
+                    "transport": row.get("transport"),
+                    "hostname": host,
+                    "ip": row.get("ip"),
+                    "port": port,
+                    "latency_ms": row.get("latency_ms"),
+                    "speed_mbps": row.get("speed_mbps"),
+                    "availability_status": row.get("availability_status"),
+                    "last_checked_at": row.get("last_checked_at"),
+                    "config_updated_at": row.get("config_updated_at"),
+                    "source": "PublicVPNList API v1",
+                    "udp_tunnel_verified": False,
+                    "game_tested": False,
+                }
 
-                        stats["protocol_country_matches"] += 1
-
-                        key = (
-                            f"{candidate['protocol']}:"
-                            f"{candidate['country_code']}:"
-                            f"{candidate['id']}"
-                        )
-
-                        if key not in candidates:
-                            candidates[key] = candidate
-                            stats["candidates_added"] += 1
-
-                    # 返回记录少于每页上限，通常说明已到末页。
-                    if len(rows) < PER_PAGE:
-                        break
-
-                    time.sleep(1)
-
-                except Exception as exc:
-                    message = (
-                        f"{protocol}/{country}/page={page}: "
-                        f"{type(exc).__name__}: {exc}"
-                    )
-                    errors.append(message)
-                    log("[ERROR] " + message)
-
-                    # 当前查询失败，继续尝试其他协议和国家。
-                    break
+        except Exception as exc:
+            message = f"{protocol}: {type(exc).__name__}: {exc}"
+            errors.append(message)
+            log("[ERROR] " + message)
 
     OUT.mkdir(parents=True, exist_ok=True)
     output_file = OUT / "udp_candidates.json"
@@ -378,8 +223,8 @@ def main():
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source": "PublicVPNList API v1",
         "description": (
-            "UDP 协议候选节点清单；"
-            "不代表 UDP 隧道、代理连通性或 PUBG 已验证可用"
+            "日本/韩国 Hysteria2、TUIC 候选元数据；"
+            "未验证实际 UDP 隧道或 PUBG 游戏可用性"
         ),
         "candidate_count": len(candidates),
         "collection_errors": errors,
@@ -393,26 +238,14 @@ def main():
     )
 
     log("=" * 50)
-    log(f"请求成功数：{stats['requests_ok']}")
-    log(f"API 返回记录总数：{stats['records_received']}")
-    log(f"通过协议和国家检查：{stats['protocol_country_matches']}")
-    log(f"最终候选数量：{len(candidates)}")
+    log(f"协议记录数量：{stats['protocol_records']}")
+    log(f"日本/韩国记录数：{stats['jp_kr_records']}")
+    log(f"最终候选数：{len(candidates)}")
     log(f"采集错误数：{len(errors)}")
     log(f"输出文件：{output_file}")
     log("=" * 50)
 
-    if stats["records_rejected"]:
-        log(
-            "[REJECTED] "
-            + json.dumps(
-                stats["records_rejected"],
-                ensure_ascii=False,
-            )
-        )
-
-    # 只有完全没有成功请求且所有请求都失败时才返回失败。
-    # 成功请求但没有匹配节点时保留诊断 JSON，方便排查。
-    if stats["requests_ok"] == 0 and errors:
+    if not stats["protocol_records"] and errors:
         sys.exit(1)
 
 
