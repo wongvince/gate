@@ -158,7 +158,13 @@ def main():
                     continue
 
                 actual_protocol = str(row.get("protocol") or "").lower()
-                country = str(row.get("country_code") or "").upper()
+                country = str(row.get("country_code") or "").strip().upper()
+                country_name = str(row.get("country_name") or "").strip().lower()
+                if not country:
+                    if country_name in ("japan", "jp", "日本"):
+                        country = "JP"
+                    elif country_name in ("south korea", "korea, republic of", "korea", "kr", "韩国", "대한민국"):
+                        country = "KR"
 
                 if actual_protocol != protocol:
                     stats["rejected"]["protocol_mismatch"] = (
