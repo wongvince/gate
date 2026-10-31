@@ -4,9 +4,8 @@ name: PublicVPNList UDP Candidates
 on:
   workflow_dispatch:
 
-  # 如果想每小时自动更新，取消下面两行注释
-  # schedule:
-  #   - cron: "0 * * * *"
+  schedule:
+    - cron: "0 */6 * * *"
 
 permissions:
   contents: read
@@ -20,7 +19,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 30
 
     steps:
       - name: Checkout
