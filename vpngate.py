@@ -43,7 +43,7 @@ MAX_WORKERS = 20
 MAX_TEST_NODES = 100
 
 # 找到多少个成功代理就停止提交新任务
-TARGET_SUCCESS = 10
+TARGET_SUCCESS = 30
 
 # 单个 Worker 请求超时
 REQUEST_TIMEOUT = 12
