@@ -2,22 +2,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-"""
-ProxyScrape + Cloudflare Worker + YouTube 检测
-
-成功条件：
-1. ProxyScrape 提供代理候选
-2. Cloudflare Worker 返回 HTTP 200
-3. Worker JSON 中 success 必须为 true
-4. 延迟只采用 Worker 返回的 responseTime
-
-输出：
-public/data.json
-public/index.html
-public/nodes.txt
-public/youtube_ok.txt
-"""
-
 import os
 import re
 import json
@@ -27,14 +11,18 @@ import logging
 import ipaddress
 from pathlib import Path
 from urllib.parse import urlparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import (
+    ThreadPoolExecutor,
+    wait,
+    FIRST_COMPLETED
+)
 
 import requests
 
 
-# =========================
-# 基本配置
-# =========================
+# =====================================
+# 配置
+# =====================================
 
 PROXYSCRAPE_API = os.getenv(
     "PROXYSCRAPE_API",
@@ -46,17 +34,29 @@ WORKER_BASE_URL = os.getenv(
     "https://wong.wong123.ccwu.cc"
 ).rstrip("/")
 
-PUBLIC_DIR = Path(os.getenv("PUBLIC_DIR", "public"))
+PUBLIC_DIR = Path("public")
 
-MAX_WORKERS = int(os.getenv("MAX_WORKERS", "20"))
-REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "45"))
+# 并发数
+MAX_WORKERS = 20
 
-SUPPORTED_PROTOCOLS = {"http", "https", "socks5"}
+# 最多测试多少个代理
+MAX_TEST_NODES = 100
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
-)
+# 找到多少个成功代理就停止提交新任务
+TARGET_SUCCESS = 10
+
+# 单个 Worker 请求超时
+REQUEST_TIMEOUT = 12
+
+SUPPORTED_PROTOCOLS = {
+    "http",
+    "https",
+    "socks5"
+}
+
+HEADERS = {
+    "User-Agent": "Mozilla/5.0"
+}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -64,46 +64,25 @@ logging.basicConfig(
 )
 
 session = requests.Session()
-session.headers.update({"User-Agent": USER_AGENT})
+session.headers.update(HEADERS)
 
 
-# =========================
-# 获取 ProxyScrape 数据
-# =========================
+# =====================================
+# 获取 ProxyScrape
+# =====================================
 
 def fetch_proxyscrape():
 
-    logging.info("========== 获取 ProxyScrape 数据 ==========")
+    logging.info("正在获取 ProxyScrape 代理列表")
 
     response = session.get(
         PROXYSCRAPE_API,
-        timeout=30
+        timeout=25
     )
 
     response.raise_for_status()
 
-    try:
-        data = response.json()
-    except Exception as exc:
-        raise RuntimeError(
-            f"ProxyScrape 返回的不是有效 JSON：{exc}"
-        )
-
-    records = extract_records(data)
-
-    logging.info("ProxyScrape 原始记录：%s", len(records))
-
-    return records
-
-
-def extract_records(data):
-    """
-    兼容常见 JSON 结构：
-    [...]
-    {"data": [...]}
-    {"proxies": [...]}
-    {"results": [...]}
-    """
+    data = response.json()
 
     if isinstance(data, list):
         return data
@@ -117,33 +96,37 @@ def extract_records(data):
             "items",
             "proxy_list"
         ):
-            value = data.get(key)
 
-            if isinstance(value, list):
-                return value
+            if isinstance(data.get(key), list):
+                return data[key]
 
     raise RuntimeError(
-        "无法识别 ProxyScrape JSON 数据结构，请检查 API 返回格式"
+        "无法识别 ProxyScrape 返回的数据结构"
     )
 
 
-# =========================
-# 解析代理地址
-# =========================
+# =====================================
+# 解析代理
+# =====================================
 
-def parse_proxy_address(address):
+def parse_address(address):
+
+    try:
+
+        parsed = urlparse(str(address))
+
+        if parsed.scheme and parsed.hostname:
+
+            return (
+                parsed.hostname,
+                parsed.port,
+                parsed.scheme.lower()
+            )
+
+    except Exception:
+        pass
 
     address = str(address).strip()
-
-    if "://" in address:
-
-        parsed = urlparse(address)
-
-        return (
-            parsed.hostname,
-            parsed.port,
-            parsed.scheme.lower()
-        )
 
     if address.count(":") == 1:
 
@@ -160,28 +143,19 @@ def valid_host(host):
     if not host:
         return False
 
-    host = str(host).strip()
-
-    if len(host) > 253:
-        return False
-
     try:
-        ipaddress.ip_address(host)
+        ipaddress.ip_address(str(host))
         return True
     except ValueError:
-        pass
-
-    return bool(
-        re.fullmatch(
-            r"[a-zA-Z0-9.-]+",
-            host
+        return bool(
+            re.fullmatch(
+                r"[a-zA-Z0-9.-]+",
+                str(host)
+            )
         )
-    )
 
 
 def normalize_candidates(records):
-
-    logging.info("========== 解析代理候选 ==========")
 
     candidates = []
     seen = set()
@@ -216,8 +190,9 @@ def normalize_candidates(records):
         address_protocol = None
 
         if address:
+
             parsed_host, parsed_port, address_protocol = (
-                parse_proxy_address(address)
+                parse_address(address)
             )
 
             host = host or parsed_host
@@ -256,17 +231,12 @@ def normalize_candidates(records):
             "port": port
         })
 
-    logging.info(
-        "有效候选代理：%s",
-        len(candidates)
-    )
-
     return candidates
 
 
-# =========================
-# Cloudflare Worker 检测
-# =========================
+# =====================================
+# Worker 检测 YouTube
+# =====================================
 
 def check_one(proxy):
 
@@ -274,16 +244,12 @@ def check_one(proxy):
     host = proxy["host"]
     port = proxy["port"]
 
-    address = f"{host}:{port}"
-
-    check_url = f"{WORKER_BASE_URL}/check"
-
     try:
 
         response = session.get(
-            check_url,
+            WORKER_BASE_URL + "/check",
             params={
-                protocol: address
+                protocol: f"{host}:{port}"
             },
             timeout=REQUEST_TIMEOUT
         )
@@ -296,15 +262,7 @@ def check_one(proxy):
                 "error": f"Worker HTTP {response.status_code}"
             }
 
-        try:
-            result = response.json()
-        except Exception:
-
-            return {
-                **proxy,
-                "success": False,
-                "error": "Worker 返回内容不是 JSON"
-            }
+        result = response.json()
 
         if not isinstance(result, dict):
 
@@ -314,9 +272,7 @@ def check_one(proxy):
                 "error": "Worker JSON 格式错误"
             }
 
-        success = result.get("success") is True
-
-        if not success:
+        if result.get("success") is not True:
 
             return {
                 **proxy,
@@ -324,18 +280,21 @@ def check_one(proxy):
                 "error": result.get("error", "YouTube 检测失败")
             }
 
-        response_time = result.get("responseTime")
+        latency = result.get("responseTime")
 
         try:
-            response_time = float(response_time)
+            latency = float(latency)
         except (TypeError, ValueError):
-            response_time = None
+            latency = None
 
         return {
             **proxy,
             "success": True,
-            "responseTime": response_time,
-            "target": result.get("target", "www.youtube.com"),
+            "responseTime": latency,
+            "target": result.get(
+                "target",
+                "www.youtube.com"
+            ),
             "statusCode": result.get("statusCode"),
             "colo": result.get("colo")
         }
@@ -349,117 +308,198 @@ def check_one(proxy):
         }
 
 
-# =========================
-# 批量检测
-# =========================
+# =====================================
+# 智能并发检测
+# 找到10个成功就不再提交新任务
+# =====================================
 
 def check_all(candidates):
 
-    logging.info("========== 开始 YouTube 检测 ==========")
-
     results = []
+    next_index = 0
+    success_count = 0
+    worker_errors = 0
 
-    if not candidates:
-        logging.warning("没有可检测的代理")
-        return results
+    total = len(candidates)
 
-    with ThreadPoolExecutor(
+    logging.info("候选代理：%s", total)
+    logging.info("并发数量：%s", MAX_WORKERS)
+    logging.info("成功目标：%s", TARGET_SUCCESS)
+
+    executor = ThreadPoolExecutor(
         max_workers=MAX_WORKERS
-    ) as executor:
+    )
 
-        futures = [
-            executor.submit(check_one, proxy)
-            for proxy in candidates
-        ]
+    pending = {}
 
-        for index, future in enumerate(
-            as_completed(futures),
-            start=1
+    def submit_next():
+
+        nonlocal next_index
+
+        if next_index >= total:
+            return False
+
+        proxy = candidates[next_index]
+
+        future = executor.submit(
+            check_one,
+            proxy
+        )
+
+        pending[future] = proxy
+
+        next_index += 1
+
+        return True
+
+    try:
+
+        # 先启动第一批
+        for _ in range(
+            min(MAX_WORKERS, total)
         ):
+            submit_next()
 
-            try:
-                result = future.result()
+        while pending:
+
+            done, _ = wait(
+                pending,
+                return_when=FIRST_COMPLETED
+            )
+
+            for future in done:
+
+                proxy = pending.pop(future)
+
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = {
+                        **proxy,
+                        "success": False,
+                        "error": str(exc)
+                    }
+
                 results.append(result)
 
-                if result["success"]:
+                if result.get("success") is True:
 
-                    latency = result.get("responseTime")
+                    success_count += 1
 
                     logging.info(
-                        "[成功] %s://%s:%s | Worker延迟：%s ms",
+                        "[成功 %s/%s] %s://%s:%s | %s ms",
+                        success_count,
+                        TARGET_SUCCESS,
                         result["protocol"],
                         result["host"],
                         result["port"],
-                        latency if latency is not None else "未知"
+                        result.get("responseTime", "未知")
                     )
 
                 else:
 
+                    error = result.get("error", "")
+
+                    if (
+                        error.startswith("Worker HTTP")
+                        or error.startswith("Worker JSON")
+                    ):
+                        worker_errors += 1
+
                     logging.info(
-                        "[失败] %s://%s:%s | %s",
-                        result["protocol"],
-                        result["host"],
-                        result["port"],
-                        result.get("error", "检测失败")
+                        "[失败] %s://%s:%s",
+                        proxy["protocol"],
+                        proxy["host"],
+                        proxy["port"]
                     )
 
-            except Exception as exc:
+            # 达到目标后不再提交新任务
+            if success_count >= TARGET_SUCCESS:
 
-                logging.error(
-                    "检测任务异常：%s",
-                    exc
-                )
-
-            if index % 20 == 0:
                 logging.info(
-                    "检测进度：%s/%s",
-                    index,
-                    len(futures)
+                    "已经找到 %s 个成功代理，停止提交新任务",
+                    TARGET_SUCCESS
                 )
 
-    return results
+                break
+
+            # 只补充空出来的并发位置
+            for _ in range(
+                MAX_WORKERS - len(pending)
+            ):
+
+                if not submit_next():
+                    break
+
+    finally:
+
+        # 取消尚未开始的任务
+        for future in pending:
+            future.cancel()
+
+        executor.shutdown(
+            wait=True,
+            cancel_futures=True
+        )
+
+    logging.info(
+        "本轮实际完成检测：%s 个",
+        len(results)
+    )
+
+    logging.info(
+        "成功代理：%s 个",
+        success_count
+    )
+
+    return results, worker_errors
 
 
-# =========================
+# =====================================
 # 输出文件
-# =========================
+# =====================================
 
-def write_outputs(success_nodes, total, worker_errors):
+def write_outputs(results, total, worker_errors):
 
     PUBLIC_DIR.mkdir(
         parents=True,
         exist_ok=True
     )
 
-    # Worker 全部请求异常时，不覆盖旧结果
-    if total > 0 and worker_errors == total:
+    # 全部 Worker 请求异常时，不覆盖旧结果
+    if total > 0 and worker_errors == len(results):
 
         logging.error(
-            "所有 Worker 请求均异常，本次不覆盖旧文件"
+            "Worker 请求全部异常，不覆盖旧文件"
         )
 
         return
 
+    success_nodes = [
+        item for item in results
+        if item.get("success") is True
+    ]
+
     success_nodes.sort(
-        key=lambda x: (
-            x["responseTime"]
-            if x.get("responseTime") is not None
+        key=lambda item: (
+            item["responseTime"]
+            if item.get("responseTime") is not None
             else float("inf")
         )
     )
 
     data = {
         "updated_at": time.strftime(
-            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M:%S UTC",
             time.gmtime()
-        ) + " UTC",
+        ),
         "target": "https://www.youtube.com/",
+        "tested_count": len(results),
         "candidate_count": total,
         "success_count": len(success_nodes),
         "success_nodes": success_nodes
     }
 
-    # data.json
     (PUBLIC_DIR / "data.json").write_text(
         json.dumps(
             data,
@@ -469,27 +509,17 @@ def write_outputs(success_nodes, total, worker_errors):
         encoding="utf-8"
     )
 
-    # nodes.txt
     node_lines = []
+    youtube_lines = []
 
     for node in success_nodes:
 
-        node_lines.append(
+        address = (
             f'{node["protocol"]}://'
             f'{node["host"]}:{node["port"]}'
         )
 
-    (PUBLIC_DIR / "nodes.txt").write_text(
-        "\n".join(node_lines) + (
-            "\n" if node_lines else ""
-        ),
-        encoding="utf-8"
-    )
-
-    # youtube_ok.txt
-    youtube_lines = []
-
-    for node in success_nodes:
+        node_lines.append(address)
 
         latency = node.get("responseTime")
 
@@ -500,10 +530,15 @@ def write_outputs(success_nodes, total, worker_errors):
         )
 
         youtube_lines.append(
-            f'{node["protocol"]}://'
-            f'{node["host"]}:{node["port"]}'
-            f'  # YouTube可访问 | {latency_text}'
+            f"{address} # YouTube可访问 | {latency_text}"
         )
+
+    (PUBLIC_DIR / "nodes.txt").write_text(
+        "\n".join(node_lines) + (
+            "\n" if node_lines else ""
+        ),
+        encoding="utf-8"
+    )
 
     (PUBLIC_DIR / "youtube_ok.txt").write_text(
         "\n".join(youtube_lines) + (
@@ -512,10 +547,14 @@ def write_outputs(success_nodes, total, worker_errors):
         encoding="utf-8"
     )
 
-    # index.html
     rows = []
 
     for index, node in enumerate(success_nodes, 1):
+
+        address = (
+            f'{node["protocol"]}://'
+            f'{node["host"]}:{node["port"]}'
+        )
 
         latency = node.get("responseTime")
 
@@ -525,17 +564,12 @@ def write_outputs(success_nodes, total, worker_errors):
             else "未知"
         )
 
-        proxy = (
-            f'{node["protocol"]}://'
-            f'{node["host"]}:{node["port"]}'
-        )
-
         rows.append(
             "<tr>"
             f"<td>{index}</td>"
-            f"<td>{html.escape(proxy)}</td>"
+            f"<td>{html.escape(address)}</td>"
             f"<td>{html.escape(latency_text)}</td>"
-            f"<td>成功</td>"
+            "<td style='color:green'>成功</td>"
             "</tr>"
         )
 
@@ -544,26 +578,23 @@ def write_outputs(success_nodes, total, worker_errors):
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>YouTube 代理检测结果</title>
+<title>YouTube代理检测</title>
 <style>
-body{{font-family:Arial,sans-serif;margin:25px;background:#f5f5f5}}
-h2{{color:#222}}
-.box{{background:white;padding:18px;border-radius:8px}}
-table{{width:100%;border-collapse:collapse;background:white}}
-th,td{{padding:10px;border-bottom:1px solid #ddd;text-align:left}}
-th{{background:#eee}}
-.ok{{color:green;font-weight:bold}}
+body{{font-family:Arial;margin:25px;background:#f5f5f5}}
+.box{{background:white;padding:20px;border-radius:8px}}
+table{{width:100%;border-collapse:collapse}}
+td,th{{padding:10px;border-bottom:1px solid #ddd;text-align:left}}
 </style>
 </head>
 <body>
 <div class="box">
-<h2>ProxyScrape YouTube 代理检测</h2>
-<p>目标：https://www.youtube.com/</p>
-<p>候选数量：{total}</p>
-<p>检测成功：{len(success_nodes)}</p>
+<h2>YouTube代理检测结果</h2>
+<p>检测目标：www.youtube.com</p>
+<p>实际检测数量：{len(results)}</p>
+<p>成功数量：{len(success_nodes)}</p>
 <p>更新时间：{html.escape(data["updated_at"])}</p>
 <table>
-<tr><th>序号</th><th>代理地址</th><th>Worker延迟</th><th>结果</th></tr>
+<tr><th>序号</th><th>代理</th><th>Worker延迟</th><th>结果</th></tr>
 {''.join(rows)}
 </table>
 </div>
@@ -576,59 +607,61 @@ th{{background:#eee}}
         encoding="utf-8"
     )
 
-    logging.info("========== 输出完成 ==========")
-    logging.info("成功节点：%s", len(success_nodes))
-    logging.info("输出目录：%s", PUBLIC_DIR)
+    logging.info("输出完成")
+    logging.info("成功代理：%s", len(success_nodes))
 
 
-# =========================
+# =====================================
 # 主程序
-# =========================
+# =====================================
 
 def main():
 
-    logging.info("================================")
-    logging.info("ProxyScrape YouTube 检测启动")
-    logging.info("Worker：%s", WORKER_BASE_URL)
-    logging.info("================================")
+    start = time.time()
+
+    logging.info("========== YouTube代理检测开始 ==========")
+
+    logging.info(
+        "Worker：%s",
+        WORKER_BASE_URL
+    )
 
     records = fetch_proxyscrape()
 
     candidates = normalize_candidates(records)
 
+    logging.info(
+        "可用协议候选：%s",
+        len(candidates)
+    )
+
     if not candidates:
         raise RuntimeError(
-            "没有解析到可检测的 HTTP/HTTPS/SOCKS5 代理"
+            "没有解析到 HTTP、HTTPS 或 SOCKS5 候选代理"
         )
 
-    results = check_all(candidates)
+    # 只取前100个
+    candidates = candidates[:MAX_TEST_NODES]
 
-    success_nodes = [
-        item for item in results
-        if item.get("success") is True
-    ]
-
-    worker_errors = sum(
-        1 for item in results
-        if item.get("error", "").startswith(
-            "Worker HTTP"
-        )
-        or item.get("error", "").startswith(
-            "Worker 返回"
-        )
+    logging.info(
+        "本轮最多测试：%s 个",
+        len(candidates)
     )
 
-    logging.info("================================")
-    logging.info("候选代理：%s", len(candidates))
-    logging.info("Worker 检测成功：%s", len(success_nodes))
-    logging.info("Worker 请求异常：%s", worker_errors)
-    logging.info("================================")
+    results, worker_errors = check_all(candidates)
 
     write_outputs(
-        success_nodes,
-        len(candidates),
+        results,
+        len(results),
         worker_errors
     )
+
+    logging.info(
+        "总耗时：%.1f 秒",
+        time.time() - start
+    )
+
+    logging.info("========== 检测结束 ==========")
 
 
 if __name__ == "__main__":
