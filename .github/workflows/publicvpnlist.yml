@@ -39,12 +39,11 @@ jobs:
         env:
           PUBLICVPNLIST_TOKEN: ${{ secrets.PUBLICVPNLIST_TOKEN }}
           WORKER_CHECK_URL: https://wong.wong123.ccwu.cc/check?proxy=
+          WORKER_MAX_LATENCY: "3000"
+          SOURCE_MAX_LATENCY_MS: "5000"
+          CHECK_CONCURRENCY: "5"
+          MAX_CHECK_NODES: "100"
           PUBLIC_DIR: public
-          API_MAX_LATENCY: "300"
-          WORKER_MAX_LATENCY: "300"
-          CHECK_CONCURRENCY: "8"
-          MAX_CHECK_NODES: "200"
-          FRESH_WITHIN: "86400"
 
       - name: Upload Pages artifact
         uses: actions/upload-pages-artifact@v3
