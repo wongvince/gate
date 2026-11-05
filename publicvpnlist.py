@@ -1,15 +1,4 @@
 
-
-
-
-
-
-
-
-
-
-
-        )
         if response.status_code != 200:
             return None, f"Worker HTTP {response.status_code}"
         try:
