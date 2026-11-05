@@ -213,157 +213,139 @@ function jsonResponse(data, { status = 200, origin = '' } = {}) {
 	});
 }
 
-
 async function checkProxy({ type, value }, colo) {
-    const startedAt = Date.now();
-    let proxy;
+	const startedAt = Date.now();
+	let proxy;
 
-    try {
-        proxy = parseProxyAddress(value, type, DEFAULT_PORTS[type]);
-    } catch (error) {
-        return buildCheckResult({
-            type,
-            rawValue: value,
-            proxy: null,
-            success: false,
-            colo,
-            error: error.message,
-            responseTime: Date.now() - startedAt
-        });
-    }
+	try {
+		proxy = parseProxyAddress(value, type, DEFAULT_PORTS[type]);
+	} catch (error) {
+		return buildCheckResult({
+			type,
+			rawValue: value,
+			proxy: null,
+			success: false,
+			colo: colo,
+			error: error.message,
+			responseTime: Date.now() - startedAt
+		});
+	}
 
-    let tunnel = null;
-    const targetHost = 'www.youtube.com';
-    const targetPort = 443;
+	let tunnel = null;
+	const targetHost = 'www.youtube.com';
+	const targetPort = 443;
 
-    try {
-        let tunnelPromise;
+	try {
+		let tunnelPromise;
+		if (proxy.type === 'socks5') tunnelPromise = socks5Connect(proxy, targetHost, targetPort);
+		else if (proxy.type === 'http') tunnelPromise = httpConnect(proxy, targetHost, targetPort, false);
+		else if (proxy.type === 'https') {
+			tunnelPromise = isIPHostname(proxy.hostname)
+				? httpsConnect(proxy, targetHost, targetPort)
+				: httpConnect(proxy, targetHost, targetPort, true);
+		} else if (proxy.type === 'turn') {
+			tunnelPromise = turnConnect(proxy, targetHost, targetPort);
+		} else if (proxy.type === 'sstp') {
+			tunnelPromise = sstpConnect(proxy, targetHost, targetPort);
+		} else {
+			throw new Error(`Unsupported proxy type: ${proxy.type}`);
+		}
 
-        if (proxy.type === 'socks5') {
-            tunnelPromise = socks5Connect(proxy, targetHost, targetPort);
-        } else if (proxy.type === 'http') {
-            tunnelPromise = httpConnect(proxy, targetHost, targetPort, false);
-        } else if (proxy.type === 'https') {
-            tunnelPromise = isIPHostname(proxy.hostname)
-                ? httpsConnect(proxy, targetHost, targetPort)
-                : httpConnect(proxy, targetHost, targetPort, true);
-        } else if (proxy.type === 'turn') {
-            tunnelPromise = turnConnect(proxy, targetHost, targetPort);
-        } else if (proxy.type === 'sstp') {
-            tunnelPromise = sstpConnect(proxy, targetHost, targetPort);
-        } else {
-            throw new Error(`Unsupported proxy type: ${proxy.type}`);
-        }
+		tunnel = await withTimeout(tunnelPromise, CHECK_TIMEOUT_MS, 'Proxy connection timed out');
+		const tlsSocket = new TlsClient(tunnel, {
+			serverName: stripIPv6Brackets(targetHost),
+			timeout: READ_TIMEOUT_MS,
+			allowChacha: true
+		});
+		let exit;
+		try {
+			await withTimeout(tlsSocket.handshake(), CHECK_TIMEOUT_MS, 'Target TLS handshake timed out');
+			await tlsSocket.write(encoder.encode([
+				'GET / HTTP/1.1',
+				`Host: ${targetHost}`,
+				'User-Agent: Mozilla/5.0 CF-Workers-CheckProxy/2.0',
+				'Accept: text/html,*/*',
+				'Connection: close',
+				'',
+				''
+			].join('\r\n')));
 
-        tunnel = await withTimeout(
-            tunnelPromise,
-            CHECK_TIMEOUT_MS,
-            'Proxy connection timed out'
-        );
+						let responseBuffer = new Uint8Array(0);
 
-        const tlsSocket = new TlsClient(tunnel, {
-            serverName: targetHost,
-            timeout: READ_TIMEOUT_MS,
-            allowChacha: true
-        });
+			// 只读取 HTTP 响应头，不下载 YouTube 整个网页
+			while (responseBuffer.byteLength < MAX_RESPONSE_BYTES) {
+				const value = await withTimeout(
+					tlsSocket.read(),
+					READ_TIMEOUT_MS,
+					'Reading target response timed out'
+				);
 
-        let exit;
+				if (!value) break;
+				if (!value.byteLength) continue;
 
-        try {
-            await withTimeout(
-                tlsSocket.handshake(),
-                CHECK_TIMEOUT_MS,
-                'YouTube TLS handshake timed out'
-            );
+				responseBuffer = concatUint8(responseBuffer, value);
 
-            await tlsSocket.write(encoder.encode([
-                'GET / HTTP/1.1',
-                `Host: ${targetHost}`,
-                'User-Agent: Mozilla/5.0',
-                'Accept: text/html,application/xhtml+xml',
-                'Connection: close',
-                '',
-                ''
-            ].join('\r\n')));
+				// 收到完整响应头就停止读取
+				if (indexOfHeaderEnd(responseBuffer) !== -1) break;
+			}
 
-            let responseBuffer = new Uint8Array(0);
-            let headerEndIndex = -1;
+			if (!responseBuffer.byteLength) {
+				throw new Error('Target returned no data');
+			}
 
-            while (responseBuffer.byteLength < 32768) {
-                const value = await withTimeout(
-                    tlsSocket.read(),
-                    READ_TIMEOUT_MS,
-                    'Reading YouTube response timed out'
-                );
+			const headerEndIndex = indexOfHeaderEnd(responseBuffer);
+			if (headerEndIndex === -1) {
+				throw new Error('Invalid target response headers');
+			}
 
-                if (!value) break;
-                if (!value.byteLength) continue;
+			const headerText = decoder.decode(
+				responseBuffer.slice(0, headerEndIndex)
+			);
 
-                responseBuffer = concatUint8(responseBuffer, value);
-                headerEndIndex = indexOfHeaderEnd(responseBuffer);
+			const statusLine = headerText.split('\r\n')[0] || '';
+			const statusMatch = statusLine.match(/HTTP\/\d(?:\.\d)?\s+(\d+)/i);
+			const statusCode = statusMatch ? Number(statusMatch[1]) : NaN;
 
-                if (headerEndIndex !== -1) break;
-            }
+			// HTTP 200–399 均视为目标网站可访问
+			if (!Number.isFinite(statusCode) || statusCode < 200 || statusCode >= 400) {
+				throw new Error(`YouTube request failed: ${statusLine || 'invalid status'}`);
+			}
 
-            if (headerEndIndex === -1) {
-                throw new Error('YouTube returned invalid or incomplete HTTP headers');
-            }
+			const locationMatch = headerText.match(/\r\nlocation:\s*([^\r\n]+)/i);
 
-            const headerText = decoder.decode(
-                responseBuffer.slice(0, headerEndIndex)
-            );
+			exit = {
+				target: targetHost,
+				statusCode: statusCode,
+				accessible: true,
+				redirect: locationMatch ? locationMatch[1].trim() : null
+			};
+		} finally {
+			try { tlsSocket.close(); } catch (e) { }
+		}
 
-            const statusLine = headerText.split('\r\n')[0] || '';
-            const statusMatch = statusLine.match(/HTTP\/\d(?:\.\d)?\s+(\d+)/i);
-            const statusCode = statusMatch ? Number(statusMatch[1]) : NaN;
-
-            if (!Number.isFinite(statusCode) || statusCode < 200 || statusCode >= 400) {
-                throw new Error(`YouTube request failed: ${statusLine}`);
-            }
-
-            const locationMatch = headerText.match(/\r\nlocation:\s*([^\r\n]+)/i);
-
-            exit = {
-                target: 'www.youtube.com',
-                statusCode,
-                accessible: true,
-                redirect: locationMatch ? locationMatch[1] : null
-            };
-
-        } finally {
-            try {
-                tlsSocket.close();
-            } catch (e) {}
-        }
-
-        return buildCheckResult({
-            type,
-            rawValue: value,
-            proxy,
-            success: true,
-            colo,
-            exit,
-            responseTime: Date.now() - startedAt
-        });
-
-    } catch (error) {
-        return buildCheckResult({
-            type,
-            rawValue: value,
-            proxy,
-            success: false,
-            colo,
-            error: error?.message || String(error),
-            responseTime: Date.now() - startedAt
-        });
-
-    } finally {
-        try {
-            tunnel?.close?.();
-        } catch (e) {}
-    }
+		return buildCheckResult({
+			type,
+			rawValue: value,
+			proxy,
+			success: true,
+			colo: colo,
+			exit,
+			responseTime: Date.now() - startedAt
+		});
+	} catch (error) {
+		return buildCheckResult({
+			type,
+			rawValue: value,
+			proxy,
+			success: false,
+			colo: colo,
+			error: error?.message || String(error),
+			responseTime: Date.now() - startedAt
+		});
+	} finally {
+		try { tunnel?.close?.(); } catch (e) { }
+	}
 }
-
 
 function buildCheckResult({ type, rawValue, proxy, success, colo = null, exit = null, error = null, responseTime }) {
 	const candidate = proxy ? formatProxyAuthority(proxy) : stripProxyScheme(rawValue);
@@ -7009,7 +6991,7 @@ function generateHTML(备案内容) {
 					itemObj.info.innerHTML =
 						'<span class="result-label">候选目标</span>' +
 						buildCopyableTarget(target) +
-						'<span class="result-detail">无法通过该代理访问 www.iplocate.io，请更换目标后重试。</span>';
+						'<span class="result-detail">无法通过该代理访问 www.youtube.com，请更换目标后重试。</span>';
 					itemObj.meta.innerHTML =
 						buildMetaChip('检测未通过', 'error', 'meta-chip-danger') +
 						buildMetaChip(data.error || data.message || '远端返回失败结果', 'info');
