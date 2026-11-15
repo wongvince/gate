@@ -1,0 +1,59 @@
+
+name: Multi-Source V2Ray Node Publisher
+
+on:
+  workflow_dispatch:
+
+  schedule:
+    - cron: "17 */6 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lxi-node-publisher
+  cancel-in-progress: false
+
+jobs:
+  collect-and-publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install "requests>=2.31,<3"
+
+      - name: Collect and publish nodes
+        run: python collect_nodes.py
+        env:
+          SOURCE_SUBSCRIPTION_URLS: ${{ secrets.SOURCE_SUBSCRIPTION_URLS }}
+
+          LXI_UPLOAD_URL: ${{ secrets.LXI_UPLOAD_URL }}
+          LXI_UPLOAD_TOKEN: ${{ secrets.LXI_UPLOAD_TOKEN }}
+
+          PUBLIC_DIR: public
+          CONNECT_TIMEOUT: "4"
+          CHECK_CONCURRENCY: "30"
+          MAX_NODES: "500"
+
+      - name: Save generated results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: node-results
+          path: |
+            public/tcp_candidates.json
+            public/v2rayn.txt
+            public/udp_candidates.json
+          if-no-files-found: ignore
+          retention-days: 7
