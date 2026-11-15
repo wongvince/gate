@@ -221,7 +221,7 @@ def main():
         )
 
     headers = {
-        "Authorization": "Bearer " + UPLOAD_TOKEN
+        "Authorization": f"Bearer {token}"
     }
 
     response = session.post(
@@ -230,11 +230,11 @@ def main():
         files={
             "data": (
                 "vpngate.json",
-                content.encode("utf-8"),
+                json_bytes,
                 "application/json"
             )
         },
-        timeout=TIMEOUT
+        timeout=120
     )
 
     if response.status_code != 200:
